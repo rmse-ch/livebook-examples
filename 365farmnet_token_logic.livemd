@@ -1,0 +1,148 @@
+# Connect Token Logic
+
+```elixir
+Mix.install(
+  [
+    {:joken, "~> 2.5"},
+    {:kino, "~> 0.7.0"},
+    {:httpoison, "~> 1.8"},
+    {:jason, "~> 1.4"}
+  ],
+  config: [
+    joken: [
+      default_key: [
+        signer_alg: "RS256",
+        key_pem:
+          "-----BEGIN PUBLIC KEY-----\nMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA3fGJsV7dGX/elR1x8eLn\n10ohRXTsqYRa169AK3htM3WednX1xQuVRSRdxOdKFohvAf62VS8fO4+t8tAKJuxV\nb61UXpyGGCg50u1MDFs7ZkeW7Dv/AByR838ZLnalpcDSO1EyJgmZeRbfIpAG0O27\n8RuP5+wn/CtLc6tROYehsYf8VxQ8/+UScgM4C1fMFA19kZ3nEnz9fJrp33YPYouQ\nCpCC/+ScRfbneplAtrR4dC1WcviV1DsA7lEqEJrWstOvSxQhQYuXa7QbnR8ya3Hu\nUFAl2QUSoqa+DpigYSwKVE0KDD12Y6+qwf4PF3Qa+WQzP1D1F84UOPqC7khSjLkN\nkKwcR9JsDREc3y8q6C3e5CTYQemIv2zJ0NaaASU1B4n4xHlJDXpBUaptdBf+7pe+\n8QBRU9Pgb0DdSShNKo6gpOlx9wJQoJkn/AMD4GDRWMph6qc6dHoMAMspm6BYfSLW\ncyzWv1KrYZA8rIraPh3lLNAJ1UJKTIEASVfrKQCuBB7sJqb3a1H6trQdec3ZzYL/\nRnQ/D7VZu+x7ArLDGeKZo3PmTGGoQaZT9XwVkZRt7ffTDsKmp2PiNI3jSRO5rsYc\nccWatbo95KbquQWqTmCr7oVJoH1uOHW3UsXkHwQM/2pP2MMOO9ndeFyfZ02PP7xV\ncOBQA0uGG5KhdAVVZwJBhl0CAwEAAQ==\n-----END PUBLIC KEY-----\n"
+      ]
+    ]
+  ]
+)
+```
+
+## Helper Module for the whole signing algorithm
+
+```elixir
+defmodule FarmNetJwt do
+  @pem_address_dev "https://developer.365farmnet.com/site/static/download/365FarmNet_Connect-API_public_key_development.pem"
+  @partner_id "5726c2cf-143b-4834-aa54-24a1c1516a48"
+  @partner_secret "trsL26xTtFXgPHBJE8n4ZrN6R7fWfLrK"
+
+  def download_pem do
+    {:ok, %HTTPoison.Response{status_code: 200, body: body}} = HTTPoison.get(@pem_address_dev)
+    body
+  end
+
+  def create_signer do
+    Joken.Signer.create("RS256", %{"pem" => download_pem()})
+  end
+
+  defp token_config_with_validation do
+    # Empty token configuration
+    token_config = %{}
+
+    # Validate Partner Id
+    azp = %Joken.Claim{
+      generate: fn -> @partner_id end,
+      validate: fn claim_val, _claims, _context -> claim_val == @partner_id end
+    }
+
+    Map.put(token_config, "azp", azp)
+  end
+
+  def verify_and_validate(connect_token) do
+    signer = FarmNetJwt.create_signer()
+
+    token_config_with_validation()
+    |> Joken.verify_and_validate(connect_token, signer)
+  end
+
+  def claim(claims, name, description, converter \\ & &1),
+    do: %{claim: name, description: description, value: converter.(Map.get(claims, name))}
+
+  def claim_ext(claims, name, description, converter \\ & &1),
+    do: %{
+      claim: name,
+      description: description,
+      value: converter.(Map.get(claims["fn-ext"], name))
+    }
+
+  def create_partner_token(connect_token) do
+    {:ok, connect_claims} = verify_and_validate(connect_token)
+
+    claims = %{
+      "con" => connect_token,
+      "exp" => connect_claims["exp"],
+      "iat" => connect_claims["iat"],
+      "iss" => @partner_id
+    }
+
+    partner_signer =
+      Joken.Signer.create("HS256", @partner_secret, %{"type" => "partner", "ver" => "0.1"})
+
+    {:ok, token} = Joken.Signer.sign(claims, partner_signer)
+    "Bearer #{token}"
+  end
+end
+```
+
+## Invalid Token for given Partner Id
+
+```elixir
+connect_token_input_invalid = Kino.Input.textarea("Connect Token Invalid")
+```
+
+```elixir
+connect_token_invalid = Kino.Input.read(connect_token_input_invalid)
+FarmNetJwt.verify_and_validate(connect_token_invalid)
+```
+
+## Valid Token
+
+```elixir
+connect_token_input = Kino.Input.textarea("Connect Token")
+```
+
+```elixir
+connect_token = Kino.Input.read(connect_token_input)
+{:ok, claims} = FarmNetJwt.verify_and_validate(connect_token)
+```
+
+What are the relevant information / claims for us
+
+```elixir
+connect_token_partner_id = claims["azp"]
+connect_token_base_url = claims["fn-ext"]["apiBase"]
+connect_token_language = claims["fn-ext"]["lan"]
+connect_token_expiry = claims["exp"]
+connect_token_farmnet_company_id = claims["ten"]
+connect_token_farmnet_user_id = claims["usr"]
+
+Kino.DataTable.new([
+  FarmNetJwt.claim(claims, "azp", "Partner Id"),
+  FarmNetJwt.claim_ext(claims, "apiBase", "Base URL"),
+  FarmNetJwt.claim_ext(claims, "lan", "Language"),
+  FarmNetJwt.claim_ext(claims, "cou", "Country"),
+  FarmNetJwt.claim_ext(claims, "functionalityLevel", "Functionality (test / full)"),
+  FarmNetJwt.claim(claims, "exp", "Token Expiration", &DateTime.from_unix!(&1)),
+  FarmNetJwt.claim(claims, "nbf", "Token Validity (not before)", &DateTime.from_unix!(&1)),
+  FarmNetJwt.claim(claims, "ten", "Tenant e.g. FarmNet Company Id"),
+  FarmNetJwt.claim(claims, "usr", "FarmNet User Id")
+])
+```
+
+## Create a Partner Token
+
+```elixir
+auth_header = FarmNetJwt.create_partner_token(connect_token)
+```
+
+## Ask 365FarmNet API
+
+```elixir
+url =
+  "#{connect_token_base_url}/connect/v1/fields?includeGeometry=true&withInactive=true&includeSoilType=true&withHistoricalFields=true"
+
+%HTTPoison.Response{body: body} = HTTPoison.get!(url, %{"Authorization" => auth_header})
+Jason.decode!(body)
+```
